@@ -1,0 +1,41 @@
+# Python Virtual Environments
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDEs / OS files
+.vscode/
+.idea/
+.DS_Store
+
+# -------------------------------------
+# WAWA AUTOMATION SPECIFIC OUTPUT FILES
+# -------------------------------------
+# Ignore all downloaded PDFs and UI screenshots
+downloaded_receipts/
+
+# Ignore all generated XML screenshots
+xml_visual_evidence/
+
+# Ignore all generated Excel reports
+test_evidence/
+*.xlsx
+
+# Ignore the dynamically generated JSON ledgers
+# (If you have a config.json you DO want to keep, add an exception below this like '!config.json')
+ui_scraped_results.json
+xml_batch_results.json
+comparison_results.json
+target_receipts.json
+
+# Ignore loose screenshots or PDFs in the root
+*.png
+*.pdf
+
+# Security / Credentials
+.env
+*auth_state*.json
+*auth_state*.json.bak
