@@ -15,6 +15,8 @@ PASS_BG = "E2EFDA"
 PASS_TEXT = "375623"
 FAIL_BG = "F8CECC"
 FAIL_TEXT = "A61C00"
+WARN_BG = "FFF2CC"
+WARN_TEXT = "9C6500"
 
 TITLE_FONT = Font(bold=True, color="FFFFFF", size=13)
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -27,9 +29,11 @@ HEADER_FILL = PatternFill(start_color=STEEL_BLUE, end_color=STEEL_BLUE, fill_typ
 ALT_ROW_FILL = PatternFill(start_color=LIGHT_GRAY, end_color=LIGHT_GRAY, fill_type="solid")
 PASS_FILL = PatternFill(start_color=PASS_BG, end_color=PASS_BG, fill_type="solid")
 FAIL_FILL = PatternFill(start_color=FAIL_BG, end_color=FAIL_BG, fill_type="solid")
+WARN_FILL = PatternFill(start_color=WARN_BG, end_color=WARN_BG, fill_type="solid")
 
 PASS_FONT = Font(color=PASS_TEXT, bold=True)
 FAIL_FONT = Font(color=FAIL_TEXT, bold=True)
+WARN_FONT = Font(color=WARN_TEXT, bold=True)
 
 # Crisp, dark borders for the data grid and image backgrounds
 THIN_BORDER = Border(left=Side(style='thin', color="000000"), 
@@ -38,7 +42,6 @@ THIN_BORDER = Border(left=Side(style='thin', color="000000"),
                      bottom=Side(style='thin', color="000000"))
 
 def write_section_title(ws, row_idx, title, start_col=1, end_col=10):
-    """Draws a clean, dark slate section header."""
     ws.merge_cells(start_row=row_idx, start_column=start_col, end_row=row_idx, end_column=end_col)
     cell = ws.cell(row=row_idx, column=start_col, value=title)
     cell.fill = SECTION_FILL
@@ -47,7 +50,6 @@ def write_section_title(ws, row_idx, title, start_col=1, end_col=10):
     ws.row_dimensions[row_idx].height = 25
 
 def write_table_headers(ws, row_idx, headers):
-    """Draws column headers for a data table."""
     for col_idx, header in enumerate(headers, start=1):
         cell = ws.cell(row=row_idx, column=col_idx, value=header)
         cell.fill = HEADER_FILL
@@ -56,61 +58,49 @@ def write_table_headers(ws, row_idx, headers):
         cell.border = THIN_BORDER
     ws.row_dimensions[row_idx].height = 22
 
-def apply_data_row(ws, row_idx, data_array, failed_cols=None):
-    """Writes a standard data row with crisp borders and failure highlighting."""
+def apply_data_row(ws, row_idx, data_array, failed_cols=None, warning_cols=None):
     if failed_cols is None: failed_cols = []
+    if warning_cols is None: warning_cols = []
     
     for col_idx, val in enumerate(data_array, start=1):
         cell = ws.cell(row=row_idx, column=col_idx, value=val)
         
-        # Base Styling
         cell.alignment = Alignment(vertical="center", wrap_text=True)
         cell.border = THIN_BORDER
         cell.font = BOLD_DATA_FONT if col_idx == 1 else DATA_FONT
         
-        # Alternating background for XML rows to make them distinct
-        if data_array[0] == "XML" and col_idx not in failed_cols:
+        if data_array[0] == "XML" and col_idx not in failed_cols and col_idx not in warning_cols:
             cell.fill = ALT_ROW_FILL
             
-        # Failure Highlighting
         if col_idx in failed_cols:
             cell.fill = FAIL_FILL
             cell.font = Font(bold=True, color=FAIL_TEXT)
+        elif col_idx in warning_cols:
+            cell.fill = WARN_FILL
+            cell.font = WARN_FONT
             
     ws.row_dimensions[row_idx].height = 20
 
 def insert_floating_image(ws, col_letter, start_row, title, img_path, max_width=650):
-    """
-    Inserts an image, provides a native hyperlink to maximize it, and intelligently 
-    draws cell borders behind the image area so the grid looks uniform.
-    """
     if not img_path or not os.path.exists(img_path): return start_row
-    
     try:
         col_idx = column_index_from_string(col_letter)
         
-        # 1. Section Title & Maximize Link
         title_cell = ws.cell(row=start_row, column=col_idx)
-        title_cell.value = f"{title} (Click to Maximize)"
+        title_cell.value = title 
         title_cell.font = Font(bold=True, color="0563C1", underline="single", size=11)
         title_cell.hyperlink = os.path.abspath(img_path)
         ws.row_dimensions[start_row].height = 20
         
-        # 2. Process and Scale the Image
         img = Image(img_path)
         aspect_ratio = img.height / img.width
         img.width = max_width
         img.height = int(max_width * aspect_ratio)
         
-        # 3. Floating Anchor (Starts one row below the title)
         img.anchor = f"{col_letter}{start_row + 1}"
         ws.add_image(img)
         
-        # 4. Calculate Rows Spanned
-        # Standard Excel row is ~15 points. Add buffer to prevent overlaps.
         rows_spanned = int(img.height / 15.0) + 2
-        
-        # Draw background borders behind the image area
         for r in range(start_row + 1, start_row + 1 + rows_spanned):
             bg_cell = ws.cell(row=r, column=col_idx)
             bg_cell.border = THIN_BORDER
@@ -152,9 +142,6 @@ def generate_excel_report():
     os.makedirs(os.path.join(base_dir, "test_evidence"), exist_ok=True)
     wb = openpyxl.Workbook()
     
-    # -------------------------------------------------------------
-    # MASTER SUMMARY TAB
-    # -------------------------------------------------------------
     summary_ws = wb.active
     summary_ws.title = "Master Summary"
     summary_ws.sheet_view.showGridLines = False
@@ -176,14 +163,12 @@ def generate_excel_report():
     perfect_matches = 0
     failed_receipts = 0
 
-    # -------------------------------------------------------------
-    # INDIVIDUAL RECEIPT DASHBOARDS
-    # -------------------------------------------------------------
-    for r_num, data in results.items():
+    sorted_results = sorted(results.items(), key=lambda item: (item[1].get("Scenario", "Unknown"), item[0]))
+    
+    for r_num, data in sorted_results:
         scenario = data.get("Scenario", "Unknown")
         mismatches = data.get("Mismatches", [])
         
-        # 1. Update Master Summary
         overall_status = "🟢 VERIFIED" if not mismatches else "🔴 MISMATCH"
         mismatch_str = "\n".join(mismatches) if mismatches else "None"
         
@@ -215,46 +200,20 @@ def generate_excel_report():
         summary_ws.cell(row=sum_row, column=1).hyperlink = f"#'{sheet_title}'!A1"
         summary_ws.cell(row=sum_row, column=1).font = LINK_FONT
 
-        # 2. Build Individual Sheet
         ws = wb.create_sheet(title=sheet_title)
         ws.sheet_view.showGridLines = False 
-        
-        # Freeze Panes: Lock Columns A and B for side-scrolling (C7 is after metadata)
-        ws.freeze_panes = "C7"
+        ws.freeze_panes = "C4"
 
-        # Metadata Links
         ws.cell(row=1, column=1, value="Scenario:").font = BOLD_DATA_FONT
         ws.cell(row=1, column=2, value=scenario).font = DATA_FONT
         
-        pdf_path = data.get("PDF_Path", "")
-        if os.path.exists(pdf_path):
-            ws.cell(row=2, column=1, value="Source PDF:").font = BOLD_DATA_FONT
-            ws.cell(row=2, column=2, value="Open PDF").hyperlink = os.path.abspath(pdf_path)
-            ws.cell(row=2, column=2).font = LINK_FONT
+        ws.append([""]) 
+        ws.append([""]) 
 
-        # Restored JSON Links
-        ui_json_link = data.get("UI_JSON_Path", "")
-        xml_json_link = data.get("XML_JSON_Path", "")
-        
-        ws.cell(row=3, column=1, value="UI JSON:").font = BOLD_DATA_FONT
-        if ui_json_link:
-            ws.cell(row=3, column=2, value="Open UI Scrape").hyperlink = os.path.abspath(ui_json_link)
-            ws.cell(row=3, column=2).font = LINK_FONT
-            
-        ws.cell(row=4, column=1, value="XML JSON:").font = BOLD_DATA_FONT
-        if xml_json_link:
-            ws.cell(row=4, column=2, value="Open XML Extract").hyperlink = os.path.abspath(xml_json_link)
-            ws.cell(row=4, column=2).font = LINK_FONT
-
-        ws.append([""]) # Spacer (Makes max_row = 5)
-        ws.append([""]) # Spacer (Makes max_row = 6)
-
-        # Standard Column Widths (A-J Data, L-O UI Image, Q-T XML Image)
         col_widths = {"A": 22, "B": 15, "C": 55, "D": 14, "E": 14, "F": 12, "G": 12, "H": 22, "I": 18, "J": 15, "L": 3, "M": 95, "P": 3, "Q": 95}
         for col, width in col_widths.items(): 
             ws.column_dimensions[col].width = width
 
-        # Setup Image Data
         ui_data = ui_results.get(str(r_num), {})
         ui_evidence = ui_data.get("Evidence_Paths", {})
         xml_ev_dir = get_latest_xml_dir(r_num)
@@ -266,12 +225,10 @@ def generate_excel_report():
                 with open(map_path, "r") as map_f:
                     xml_mapping = json.load(map_f)
 
-        # Cursors
-        table_row = 7
-        ui_img_row = 7
-        xml_img_row = 7
+        table_row = 4
+        ui_img_row = 4
+        xml_img_row = 4
 
-        # --- HEADER BLOCK ---
         hb = data.get("Header_Block", {})
         if hb and hb.get("Headers"):
             write_section_title(ws, table_row, "📋 HEADER COMPARISON", start_col=1, end_col=9)
@@ -279,12 +236,11 @@ def generate_excel_report():
             write_table_headers(ws, table_row, hb["Headers"])
             table_row += 1
             
-            apply_data_row(ws, table_row, hb.get("UI_Row", []), hb.get("Failed_Cols", []))
+            apply_data_row(ws, table_row, hb.get("UI_Row", []), hb.get("Failed_Cols", []), hb.get("Warning_Cols", []))
             table_row += 1
-            apply_data_row(ws, table_row, hb.get("XML_Row", []), hb.get("Failed_Cols", []))
+            apply_data_row(ws, table_row, hb.get("XML_Row", []), hb.get("Failed_Cols", []), hb.get("Warning_Cols", []))
             table_row += 2
             
-            # Images
             ui_hdr_img = next((v for k, v in ui_evidence.items() if k.startswith("Header_")), None)
             xml_hdr_img = os.path.join(xml_ev_dir, xml_mapping.get("Header_Image", "")) if xml_ev_dir else None
             
@@ -292,12 +248,10 @@ def generate_excel_report():
             xml_img_row = insert_floating_image(ws, "Q", xml_img_row, "💾 XML EVIDENCE (HEADER)", xml_hdr_img, max_width=700)
             
             sync_row = max(table_row, ui_img_row, xml_img_row)
-            # Add exact number of blank rows to catch up max_row safely
             for _ in range(sync_row - ws.max_row): ws.append([""])
-            ws.append([""]) # spacer
+            ws.append([""]) 
             table_row = ui_img_row = xml_img_row = ws.max_row + 1
 
-        # --- TENDERS BLOCK ---
         tb_list = data.get("Tenders_Block", [])
         if tb_list:
             write_section_title(ws, table_row, "💳 SPLIT TENDERS", start_col=1, end_col=4)
@@ -306,9 +260,9 @@ def generate_excel_report():
             table_row += 1
             
             for t_pair in tb_list:
-                apply_data_row(ws, table_row, t_pair.get("UI_Row", []), t_pair.get("Failed_Cols", []))
+                apply_data_row(ws, table_row, t_pair.get("UI_Row", []), t_pair.get("Failed_Cols", []), t_pair.get("Warning_Cols", []))
                 table_row += 1
-                apply_data_row(ws, table_row, t_pair.get("XML_Row", []), t_pair.get("Failed_Cols", []))
+                apply_data_row(ws, table_row, t_pair.get("XML_Row", []), t_pair.get("Failed_Cols", []), t_pair.get("Warning_Cols", []))
                 table_row += 2 
                 
             ui_ftr_img = next((v for k, v in ui_evidence.items() if k.startswith("Footer_") or k.startswith("Tender_")), None)
@@ -322,7 +276,6 @@ def generate_excel_report():
             ws.append([""])
             table_row = ui_img_row = xml_img_row = ws.max_row + 1
 
-        # --- AGGREGATE BLOCK ---
         ab = data.get("Aggregate_Block", {})
         if ab and ab.get("Headers"):
             write_section_title(ws, table_row, "📊 AGGREGATES", start_col=1, end_col=4)
@@ -330,9 +283,9 @@ def generate_excel_report():
             write_table_headers(ws, table_row, ab["Headers"])
             table_row += 1
             
-            apply_data_row(ws, table_row, ab.get("UI_Row", []), ab.get("Failed_Cols", []))
+            apply_data_row(ws, table_row, ab.get("UI_Row", []), ab.get("Failed_Cols", []), ab.get("Warning_Cols", []))
             table_row += 1
-            apply_data_row(ws, table_row, ab.get("XML_Row", []), ab.get("Failed_Cols", []))
+            apply_data_row(ws, table_row, ab.get("XML_Row", []), ab.get("Failed_Cols", []), ab.get("Warning_Cols", []))
             table_row += 2
             
             if not tb_list: 
@@ -355,13 +308,20 @@ def generate_excel_report():
             write_table_headers(ws, table_row, line_cols)
             table_row += 1
             
+            # --- FIX: Independent Layout Sync ---
+            # Save the starting row for images, so the left table can compact itself 
+            # while the right images stack properly without pushing the table down!
+            img_sync_row = max(ui_img_row, xml_img_row, table_row)
+            ui_img_row = img_sync_row
+            xml_img_row = img_sync_row
+
             for line_pair in lib_list:
                 ui_row = line_pair.get("UI_Row", [])
                 xml_row = line_pair.get("XML_Row", [])
                 
-                apply_data_row(ws, table_row, ui_row, line_pair.get("Failed_Cols", []))
+                apply_data_row(ws, table_row, ui_row, line_pair.get("Failed_Cols", []), line_pair.get("Warning_Cols", []))
                 table_row += 1
-                apply_data_row(ws, table_row, xml_row, line_pair.get("Failed_Cols", []))
+                apply_data_row(ws, table_row, xml_row, line_pair.get("Failed_Cols", []), line_pair.get("Warning_Cols", []))
                 table_row += 2 
                 
                 ui_ln = ui_row[1] if len(ui_row) > 1 else "--"
@@ -382,10 +342,11 @@ def generate_excel_report():
                 if xml_img_path and xml_img_path not in [c.hyperlink.target for c in ws['Q'] if c.hyperlink]:
                     xml_img_row = insert_floating_image(ws, "Q", xml_img_row, f"💾 XML EVIDENCE (Line {xml_ln})", xml_img_path, max_width=700)
                 
-                sync_row = max(table_row, ui_img_row, xml_img_row)
-                for _ in range(sync_row - ws.max_row): ws.append([""])
-                ws.append([""]) # spacer before next pair
-                table_row = ui_img_row = xml_img_row = ws.max_row + 1
+            # AFTER the entire line items block is written, sync everything up safely
+            sync_row = max(table_row, ui_img_row, xml_img_row)
+            for _ in range(sync_row - ws.max_row): ws.append([""])
+            ws.append([""]) 
+            table_row = ui_img_row = xml_img_row = ws.max_row + 1
 
     if len(wb.sheetnames) > 1 and "Sheet" in wb.sheetnames:
         wb.remove(wb["Sheet"])

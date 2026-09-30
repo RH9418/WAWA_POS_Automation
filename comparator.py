@@ -142,13 +142,13 @@ def match_lines(x_lines, u_lines):
     def sort_key(p):
         ln = str(p[0].get('Line Number')) if p[0] else str(p[1].get('Line Number'))
         if ln.isdigit():
-            return float(ln)
+            return (int(ln), 0)
         if '_D' in ln:
             parts = ln.split('_D')
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                return float(parts[0]) + (float(parts[1]) / 100.0)
-        try: return float(ln)
-        except: return 999999.0
+                return (int(parts[0]), int(parts[1]))
+        try: return (float(ln), 0)
+        except: return (999999.0, 0)
     
     pairs.sort(key=sort_key)
     return pairs
@@ -350,10 +350,10 @@ def run_comparison(input_json_path=None):
                             if normalize_text(uv) != normalize_text(xv): match = False
                             
                     if not match:
-                        if xt and ut and col == 2: 
+                        if xt and ut: 
                             mismatches.append(f"Tender {xt.get('Type', '?')} [{field}] -> XML: '{xv}' | UI: '{uv}'")
                         failed_t_cols.append(col)
-                        
+
             tender_block_list.append({
                 "Headers": tender_cols,
                 "UI_Row": ui_t_row,
@@ -420,18 +420,27 @@ def run_comparison(input_json_path=None):
                 safe_display(xl.get('L Fuel Pump ID'))
             ]
             
-            # --- DISCOUNT TOLERANCE MODE ---
+            # --- TOLERANCE MODES (DISCOUNT & VOID/CANCEL) ---
+            nx_type = normalize_text(xl.get('Line Type', ''))
+            nu_type = normalize_text(ul.get('Line Type', ''))
+            
             is_discount = False
             if '_D' in str(xl.get('Line Number', '')) or '_D' in str(ul.get('Line Number', '')):
                 is_discount = True
-            if normalize_text(xl.get('Line Type', '')) == 'DISCOUNT':
+            if nx_type == 'DISCOUNT':
                 is_discount = True
+                
+            # Define the exact Void/Cancel scenario
+            is_void_cancel = (nx_type in ['VOID', 'CANCEL'] and nu_type == 'CANCEL')
 
             failed_line_cols = []
+            warning_line_cols = []
+            
             for col, (uv, xv) in enumerate(zip(ui_row, xml_row), start=1):
                 if col > 1:
                     field = line_cols[col-1]
                     match = True
+                    is_warning = False
                     
                     if not xl:
                         match = False
@@ -440,21 +449,34 @@ def run_comparison(input_json_path=None):
                         match = False
                         if col == 2: mismatches.append(f"Missing in UI: {xl.get('Item Name')} (XML Line {xl.get('Line Number')})")
                     else:
-                        # 1. Discount Parent Matching
-                        if field == 'Line Number' and is_discount:
+                        # 1. VOID / CANCEL EXCEPTIONS (NEW)
+                        if is_void_cancel and field == 'Line Type':
+                            match = True
+                            is_warning = True
+                            
+                        elif is_void_cancel and field in ['Quantity', 'Value', 'Line Item Weight']:
+                            # If UI properly zeroed out the value, it's a valid match
+                            if normalize_currency(uv) == 0.0:
+                                match = True
+                                is_warning = True 
+                            else:
+                                match = False
+                                
+                        # 2. Discount Parent Matching
+                        elif field == 'Line Number' and is_discount:
                             nx_parent = str(xv).split('_')[0]
                             nu_parent = str(uv).split('_')[0]
                             if nx_parent == nu_parent: match = True
                             else: match = False
 
-                        # 2. Ignore hidden UI values for discounts
+                        # 3. Ignore hidden UI values for discounts
                         elif field in ['Item Price', 'Line Type', 'Quantity', 'Price Override Indicator', 'Line Item Weight', 'L Fuel Pump ID'] and is_discount:
                             if normalize_text(uv) in ["NONE", "--"]:
                                 match = True 
                             else:
                                 if normalize_currency(uv) != normalize_currency(xv): match = False
                                 
-                        # 3. Standard Field Matching
+                        # 4. Standard Field Matching
                         elif field in ['Quantity', 'Value']:
                             if normalize_currency(uv) != normalize_currency(xv): match = False
                         elif field == 'Item Price':
@@ -479,15 +501,20 @@ def run_comparison(input_json_path=None):
                         else:
                             if normalize_text(uv) != normalize_text(xv): match = False
                             
+                    # Apply the results
                     if not match:
-                        if xl and ul and col == 2: mismatches.append(f"Row {xl.get('Line Number', '?')} [{field}] -> XML: '{xv}' | UI: '{uv}'")
+                        if xl and ul: 
+                            mismatches.append(f"Row {xl.get('Line Number', '?')} [{field}] -> XML: '{xv}' | UI: '{uv}'")
                         failed_line_cols.append(col)
+                    elif is_warning:
+                        warning_line_cols.append(col)
                         
             receipt_result["Line_Items_Block"].append({
                 "Headers": line_cols,
                 "UI_Row": ui_row,
                 "XML_Row": xml_row,
-                "Failed_Cols": failed_line_cols
+                "Failed_Cols": failed_line_cols,
+                "Warning_Cols": warning_line_cols
             })
 
         receipt_result["Mismatches"] = list(set(mismatches))

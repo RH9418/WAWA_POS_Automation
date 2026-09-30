@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 
 BASE_OUTPUT_DIR = "xml_visual_evidence"
 
-# HTML & JavaScript template to render beautifully styled JSON in the headless browser
+# --- FIX: Word wrap added, and highlighting engine dynamically accepts failure data ---
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html>
@@ -47,6 +47,8 @@ HTML_TEMPLATE = r"""
             padding: 15px;
             font-size: 15px; 
             line-height: 1.6; 
+            white-space: pre-wrap; /* Fix for long item names getting cropped */
+            word-wrap: break-word;
         }
         /* VS Code Dark+ Colors */
         .json-key { color: #9cdcfe; }
@@ -55,18 +57,18 @@ HTML_TEMPLATE = r"""
         .json-boolean { color: #569cd6; }
         .json-null { color: #569cd6; font-style: italic; }
         
-        /* --- NEW: HIGHLIGHTING STYLES FOR CORE FIELDS --- */
+        /* Failure Highlighting Styles */
         .highlight-line {
-            background-color: rgba(255, 215, 0, 0.15); /* Subtle gold background */
-            display: block; /* Make background span the full line */
-            margin-left: -15px; /* Offset the <pre> padding */
+            background-color: rgba(255, 80, 80, 0.2); 
+            display: block; 
+            margin-left: -15px; 
             margin-right: -15px;
-            padding-left: 11px; /* 15px minus the 4px border */
+            padding-left: 11px; 
             padding-right: 15px;
-            border-left: 4px solid #ffd700;
+            border-left: 4px solid #ff5050;
         }
         .highlight-key {
-            color: #ffd700 !important; /* Gold key color */
+            color: #ff5050 !important; 
             font-weight: bold;
         }
     </style>
@@ -100,23 +102,30 @@ HTML_TEMPLATE = r"""
             });
         }
 
-        function applyHighlights(html) {
-            const targetFields = [
-                '"Store"', '"Receipt_Number"', '"Date"', '"Cashier"', '"POS"',
-                '"Total_Value"', '"Total_Tax"', '"Type"', '"Amount"',
-                '"Line Number"', '"Item Name"', '"Value"'
-            ];
-            
+        function applyHighlights(html, failData) {
+            if (!failData) return html;
             let lines = html.split('\n');
+            let currentLineItem = null;
+
             for (let i = 0; i < lines.length; i++) {
-                for (let field of targetFields) {
-                    let searchStr = '<span class="json-key">' + field + '</span>:';
+                // Track which item we are currently evaluating in the JSON array
+                if (lines[i].includes('"Line Number"')) {
+                    let match = lines[i].match(/"Line Number"<\/span>:\s*"([^"]+)"/);
+                    if (match) currentLineItem = match[1];
+                }
+                
+                let activeFailures = [];
+                if (failData.global) activeFailures.push(...failData.global);
+                if (failData.lineItems && currentLineItem && failData.lineItems[currentLineItem]) {
+                    activeFailures.push(...failData.lineItems[currentLineItem]);
+                }
+
+                for (let field of activeFailures) {
+                    let searchStr = '<span class="json-key">"' + field + '"</span>:';
                     if (lines[i].includes(searchStr)) {
-                        // Inject the highlight spans
                         lines[i] = '<span class="highlight-line">' + 
-                                   lines[i].replace(searchStr, '<span class="highlight-key">' + field + '</span>:') + 
+                                   lines[i].replace(searchStr, '<span class="highlight-key">"' + field + '"</span>:') + 
                                    '</span>';
-                        break; // Move to the next line once a field is highlighted
                     }
                 }
             }
@@ -125,19 +134,20 @@ HTML_TEMPLATE = r"""
 
         const contentDiv = document.getElementById('json-content');
         let highlighted = syntaxHighlight(contentDiv.textContent);
-        // Apply the line-level highlights after the syntax highlighting
-        contentDiv.innerHTML = applyHighlights(highlighted);
+        const failData = {fail_data_json};
+        contentDiv.innerHTML = applyHighlights(highlighted, failData);
     </script>
 </body>
 </html>
 """
 
-async def snap_json_screenshot(page, data_dict, label, output_dir, filename):
-    """Injects the JSON into Playwright and screenshots the rendered block."""
+async def snap_json_screenshot(page, data_dict, label, output_dir, filename, fail_data=None):
+    if fail_data is None: fail_data = {}
     raw_json = json.dumps(data_dict, indent=4)
     safe_json = raw_json.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    fail_data_json = json.dumps(fail_data)
     
-    html_content = HTML_TEMPLATE.replace("{raw_json}", safe_json).replace("{label}", label)
+    html_content = HTML_TEMPLATE.replace("{raw_json}", safe_json).replace("{label}", label).replace("{fail_data_json}", fail_data_json)
     await page.set_content(html_content)
     
     box_locator = page.locator("#capture-box")
@@ -148,9 +158,20 @@ async def snap_json_screenshot(page, data_dict, label, output_dir, filename):
     return filename
 
 async def process_screenshots(batch_data):
-    """Processes the in-memory batch dictionary directly to generate screenshots."""
+    """
+    Called strictly in Phase 4.5. Maps comparator failures precisely to JSON payload fields
+    and creates Red bounding boxes inside the images.
+    """
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    comp_results = {}
+    try:
+        if os.path.exists("comparison_results.json"):
+            with open("comparison_results.json", "r") as f:
+                comp_results = json.load(f)
+    except:
+        pass
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -158,8 +179,7 @@ async def process_screenshots(batch_data):
         page = await context.new_page()
 
         for filename_key, receipts in batch_data.items():
-            if "error" in receipts:
-                continue
+            if "error" in receipts: continue
             
             print(f"\n📂 Processing Screenshots for File Group: {filename_key}")
             for receipt_num, receipt_data in receipts.items():
@@ -175,28 +195,49 @@ async def process_screenshots(batch_data):
                     "Line_Items_Mapping": {}
                 }
                 
-                # 1. Header Screenshot
+                r_comp = comp_results.get(receipt_num, {})
+                
+                # --- 1. Map Header Failures ---
+                header_fails = []
+                hb = r_comp.get("Header_Block", {})
+                if hb:
+                    for c in hb.get("Failed_Cols", []):
+                        if c > 1: header_fails.append(hb["Headers"][c-1])
+                        
                 await snap_json_screenshot(
-                    page, 
-                    {"Header": receipt_data.get("Header", {})}, 
-                    f"Receipt #{receipt_num} | Header",
-                    receipt_dir,
-                    "Header.png"
+                    page, {"Header": receipt_data.get("Header", {})}, f"Receipt #{receipt_num} | Header",
+                    receipt_dir, "Header.png", fail_data={"global": header_fails}
                 )
 
-                # 2. Footer Screenshot
+                # --- 2. Map Footer Failures ---
+                footer_fails = []
+                footer_key_map = {"Total Value": "Total_Value", "Total Tax": "Total_Tax", "Amount": "Amount", "Tender Type": "Type", "Card Number": "Card_Number"}
+                
+                ab = r_comp.get("Aggregate_Block", {})
+                if ab:
+                    for c in ab.get("Failed_Cols", []):
+                        if c > 1: footer_fails.append(footer_key_map.get(ab["Headers"][c-1], ab["Headers"][c-1]))
+
+                for tb in r_comp.get("Tenders_Block", []):
+                    for c in tb.get("Failed_Cols", []):
+                        if c > 1: footer_fails.append(footer_key_map.get(tb["Headers"][c-1], tb["Headers"][c-1]))
+
                 await snap_json_screenshot(
-                    page, 
-                    {
-                        "Tenders": receipt_data.get("Tenders", []), 
-                        "Totals": receipt_data.get("Totals", {})
-                    }, 
-                    f"Receipt #{receipt_num} | Footer",
-                    receipt_dir,
-                    "Footer.png"
+                    page, {"Tenders": receipt_data.get("Tenders", []), "Totals": receipt_data.get("Totals", {})}, 
+                    f"Receipt #{receipt_num} | Footer", receipt_dir, "Footer.png", fail_data={"global": footer_fails}
                 )
 
-                # 3. Line Items (Chunked into 5)
+                # --- 3. Map Exact Line Item Failures ---
+                line_fails = {}
+                for lib in r_comp.get("Line_Items_Block", []):
+                    xml_row = lib.get("XML_Row", [])
+                    if len(xml_row) > 1:
+                        ln = str(xml_row[1])
+                        fails = []
+                        for c in lib.get("Failed_Cols", []):
+                            if c > 1: fails.append(lib["Headers"][c-1])
+                        if fails: line_fails[ln] = fails
+
                 line_items = receipt_data.get("Line_Items", [])
                 chunk_size = 5
                 
@@ -212,21 +253,15 @@ async def process_screenshots(batch_data):
                         img_filename = f"Items_{start_idx}-{end_idx}.png"
                         
                         await snap_json_screenshot(
-                            page, 
-                            {f"Items_{start_idx}_to_{end_idx}": chunk},
-                            label,
-                            receipt_dir,
-                            img_filename
+                            page, {f"Items_{start_idx}_to_{end_idx}": chunk}, label, receipt_dir, img_filename, 
+                            fail_data={"lineItems": line_fails}
                         )
                         
-                        # Populate Mapping File for these specific line items
                         for item in chunk:
                             line_num = item.get("Line Number", str(start_idx + chunk.index(item)))
                             mapping_data["Line_Items_Mapping"][line_num] = img_filename
 
-                # Save Mapping Data
-                mapping_path = os.path.join(receipt_dir, "mapping.json")
-                with open(mapping_path, "w", encoding="utf-8") as map_file:
+                with open(os.path.join(receipt_dir, "mapping.json"), "w", encoding="utf-8") as map_file:
                     json.dump(mapping_data, map_file, indent=4)
                 print(f"      ✅ Created mapping index and snapped {len(mapping_data['Line_Items_Mapping'])} items.")
 
@@ -235,11 +270,9 @@ async def process_screenshots(batch_data):
 
 
 def strip_ns(tag):
-    """Safely strips XML namespaces from tags to make parsing reliable."""
     return tag.split('}')[-1] if '}' in tag else tag
 
 def extract_xml_data(xml_path, target_receipt_number=None):
-    """Extracts XML data (Legacy Push Model or Fast Pull Model)."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     
@@ -277,10 +310,7 @@ def extract_xml_data(xml_path, target_receipt_number=None):
             except Exception:
                 date_formatted = date_raw
 
-        # --- CRITICAL FIX: OverridingCashierID supersedes standard CashierID ---
         cashier = event.findtext('.//OverridingCashierID') or event.findtext('.//CashierID') or ""
-        # -------------------------------------------------------------------------
-        
         pos = event.findtext('.//RegisterID') or ""
 
         total_val = event.findtext('.//TransactionTotalNetAmount') or event.findtext('.//TransactionGrossAmount') or event.findtext('.//DropAmount') or "0.00"
@@ -290,8 +320,6 @@ def extract_xml_data(xml_path, target_receipt_number=None):
         tenders = []
         loyalty_card = None
         credit_cards = []
-        
-        # Track discounts per target line for dynamic D1, D2 generation
         discount_counters = {}
 
         for t_line in event.findall('.//TransactionLine'):
@@ -322,7 +350,6 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                     "Card_Number": t_card
                 })
 
-            # --- PARSE DEDICATED DISCOUNT LINES ---
             discount_line = t_line.find('.//DiscountLine')
             if discount_line is not None:
                 discount_node = discount_line.find('.//Discount')
@@ -334,7 +361,6 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                     if not target_line:
                         target_line = line_num
                         
-                    # --- FIX: Ignore Sequence 0 (Mix & Match Basket Discounts) ---
                     if target_line == '0':
                         continue
                     
@@ -349,9 +375,9 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                         "Line Number": synthetic_line_num,
                         "Item Name": d_reason,
                         "Line Type": "Discount",
-                        "Item Price": f"${float(d_amt):.2f}" if d_amt else "\$0.00",
+                        "Item Price": f"${float(d_amt):.2f}" if d_amt else "$0.00",
                         "Quantity": "1",
-                        "Value": f"${float(d_amt):.2f}" if d_amt else "\$0.00",
+                        "Value": f"${float(d_amt):.2f}" if d_amt else "$0.00",
                         "Price Override Indicator": "No",
                         "Line Item Weight": "--",
                         "L Fuel Pump ID": "--"
@@ -377,9 +403,9 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                     "Line Number": line_num,
                     "Item Name": name,
                     "Line Type": "Sale",
-                    "Item Price": f"${float(price):.2f}" if price else "\$0.00",
+                    "Item Price": f"${float(price):.2f}" if price else "$0.00",
                     "Quantity": "1", 
-                    "Value": f"${float(val):.2f}" if val else "\$0.00",
+                    "Value": f"${float(val):.2f}" if val else "$0.00",
                     "Price Override Indicator": "No",
                     "Line Item Weight": gallons,
                     "L Fuel Pump ID": pump_id 
@@ -404,19 +430,29 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                 override_flag = "Yes" if item_line.find('.//PriceOverride') is not None else "No"
                 name = f"{desc} ({code})" if code else desc
                 
-                line_type = "Sale"
-                if t_line.find('.//Cancellation') is not None or t_line.get('status') == 'cancel':
+                status_attr = t_line.get('status', 'normal').lower()
+                if status_attr == 'cancel' or t_line.find('.//Cancellation') is not None:
+                    line_type = "Cancel"
+                elif status_attr == 'void':
                     line_type = "Void"
+                elif status_attr == 'other':
+                    desc_status = t_line.findtext('.//TransactionLineStatusDescription')
+                    if desc_status and ('cancel' in desc_status.lower() or 'failure' in desc_status.lower()):
+                        line_type = "Cancel"
+                    else:
+                        line_type = "Other"
                 elif event.tag == "RefundEvent":
                     line_type = "Return"
+                else:
+                    line_type = "Sale"
                 
                 line_items.append({
                     "Line Number": line_num,
                     "Item Name": name,
                     "Line Type": line_type,
-                    "Item Price": f"${float(price):.2f}" if price else "\$0.00",
+                    "Item Price": f"${float(price):.2f}" if price else "$0.00",
                     "Quantity": str(int(float(qty))) if qty else "0",
-                    "Value": f"${float(val):.2f}" if val else "\$0.00",
+                    "Value": f"${float(val):.2f}" if val else "$0.00",
                     "Price Override Indicator": override_flag,
                     "Line Item Weight": weight,
                     "L Fuel Pump ID": "--"
@@ -448,9 +484,9 @@ def extract_xml_data(xml_path, target_receipt_number=None):
                         "Line Number": synthetic_line_num, 
                         "Item Name": s_name,
                         "Line Type": "SubItemLine",
-                        "Item Price": f"${float(s_price):.2f}" if s_price else "\$0.00",
+                        "Item Price": f"${float(s_price):.2f}" if s_price else "$0.00",
                         "Quantity": s_qty,
-                        "Value": f"${float(s_val):.2f}" if s_val else "\$0.00",
+                        "Value": f"${float(s_val):.2f}" if s_val else "$0.00",
                         "Price Override Indicator": "No",
                         "Line Item Weight": "--",
                         "L Fuel Pump ID": "--"
@@ -458,10 +494,8 @@ def extract_xml_data(xml_path, target_receipt_number=None):
 
         def sort_by_line_num(item):
             ln = str(item.get('Line Number', ''))
-            # Standard integer line numbers
             if ln.isdigit():
                 return float(ln)
-            # Handle synthetic discounts (e.g., 1_D1 -> 1.01) so they nest perfectly under parent items
             if '_D' in ln:
                 parts = ln.split('_D')
                 if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
@@ -508,7 +542,6 @@ def extract_xml_data(xml_path, target_receipt_number=None):
     return receipts_data
 
 def launch_ui():
-    """Spawns a basic UI to select a single XML file OR a whole folder."""
     root = tk.Tk()
     root.title("XML Extractor")
     root.geometry("400x200")
@@ -583,19 +616,13 @@ async def run_batch_extraction(target_path=None):
         
     print(f"\n📁 XML database extraction complete. Saved to '{output_file}'.")
     
-    # ---------------------------------------------------------
-    # NEW STEP: Generate JSON Screenshots immediately after extraction
-    # ---------------------------------------------------------
+    # Standalone execution will generate un-highlighted screenshots
     print("\n📸 Starting XML Visual Evidence Generation...")
     await process_screenshots(all_results)
     
     return output_file
 
 async def run_targeted_extraction(target_mapping, output_file="xml_batch_results.json"):
-    """
-    NEW ENTRY POINT: Receives a dictionary of { "ReceiptNumber": "Path/to/xml" } from the Orchestrator.
-    Extracts only those specific receipts.
-    """
     print("="*60)
     print("🗄️  PHASE 3: TARGETED XML DATABASE EXTRACTION (NEW PULL)")
     print("="*60)
@@ -622,10 +649,7 @@ async def run_targeted_extraction(target_mapping, output_file="xml_batch_results
         json.dump(all_results, f, indent=4)
         
     print(f"\n📁 Database extraction complete. Saved to '{output_file}'.")
-    
-    print("\n📸 Starting XML Visual Evidence Generation...")
-    await process_screenshots(all_results)
-    
+    # Screenshots removed from Phase 3 to allow Phase 4.5 to process failures first.
     return output_file
 
 if __name__ == "__main__":
